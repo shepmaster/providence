@@ -1,0 +1,15 @@
+[package]
+name = "providence"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+argh = { version = "0.1.9", default-features = false }
+futures = { version = "0.3.25", default-features = false, features = ["async-await", "std"] }
+rmp-serde = { version = "1.1.1", default-features = false }
+serde = { version = "1.0.147", default-features = false, features = ["derive"] }
+snafu = { version = "0.7.3", features = ["backtraces-impl-std", "rust_1_61"] }
+tokio = { version = "1.21.2", default-features = false, features = ["io-std", "io-util", "process", "rt-multi-thread", "sync", "time", "macros"] }
+tokio-util = { version = "0.7.4", default-features = false, features = ["io-util", "io"] }
+tracing = { version = "0.1.37", default-features = false }
+tracing-subscriber = { version = "0.3.16", default-features = false, features = ["env-filter", "fmt", "std"] }
