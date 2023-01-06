@@ -8,14 +8,14 @@ use crate::{
 use futures::prelude::*;
 use snafu::prelude::*;
 use std::{
-    io::{BufReader, BufWriter, Write},
+    io::{BufReader, BufWriter, Write, Stderr},
     ops::ControlFlow,
     process::Stdio,
-    time::Duration,
+    time::Duration, collections::BTreeMap,
 };
 use tokio::{
     process::{self, Command},
-    sync::mpsc,
+    sync::{mpsc, oneshot},
     task, time,
 };
 use tokio_util::io::SyncIoBridge;
@@ -26,56 +26,64 @@ use tracing::trace;
 #[argh(subcommand, name = "client")]
 pub struct Config {}
 
+// TODO: spawn through docker
+// TODO: spawn as non-root
+
 pub async fn main(_config: Config) -> Result<()> {
-    let (client, mut messages) = Client::spawn()?;
+    // let (client, mut messages) = Client::spawn()?;
 
-    tokio::spawn(async move {
-        trace!("message task booted");
+    // tokio::spawn(async move {
+    //     trace!("message task booted");
 
-        while let Some(msg) = messages.recv().await {
-            use ClientMessage as Msg;
+    //     while let Some(msg) = messages.recv().await {
+    //         use ClientMessage as Msg;
 
-            match msg {
-                Msg::ChildStarted(ChildStarted { psid }) => eprintln!("[{psid}] child started"),
-                Msg::ChildStopped(ChildStopped { psid }) => eprintln!("[{psid}] child stopped"),
-                Msg::Output(Output { psid, stdout, .. }) => {
-                    if let Ok(s) = std::str::from_utf8(&stdout) {
-                        eprint!("[{psid}]> {s}");
-                    }
-                }
-            }
-        }
-    });
+    //         match msg {
+    //             Msg::ChildStarted(ChildStarted { psid }) => eprintln!("[{psid}] child started"),
+    //             Msg::ChildStopped(ChildStopped { psid }) => eprintln!("[{psid}] child stopped"),
+    //             Msg::Output(Output { psid, stdout, .. }) => {
+    //                 if let Ok(s) = std::str::from_utf8(&stdout) {
+    //                     eprint!("[{psid}]> {s}");
+    //                 }
+    //             }
+    //         }
+    //     }
+    // });
 
-    let ids = (0..2).map(ProcessSequenceId::new);
+    // let ids = (0..10).map(ProcessSequenceId::new);
 
-    let work = ids.clone().map(|psid| {
-        let client = &client;
+    // let work = ids.clone().map(|psid| {
+    //     let client = &client;
 
-        async move {
-            let command = "cat".into();
-            let content = format!("hello from {psid}\n").into();
+    //     async move {
+    //         let command = "/Users/shep/Projects/providence/double-cat".into();
+    //         let content = format!("hello from {psid}\n").into();
 
-            client.send(Spawn { psid, command }).await?;
-            client.send(Input { psid, content }).await?;
+    //         client.send(Spawn { psid, command }).await?;
+    //         client.send(Input { psid, content }).await?;
 
-            Result::<_>::Ok(())
-        }
-    });
+    //         Result::<_>::Ok(())
+    //     }
+    // });
 
-    for w in future::join_all(work).await {
-        w?;
-    }
+    // for w in future::join_all(work).await {
+    //     w?;
+    // }
 
-    time::sleep(Duration::from_millis(333)).await;
+    // time::sleep(Duration::from_millis(333)).await;
 
-    let work = ids.map(|psid| client.send(Kill { psid }));
+    // let work = ids.map(|psid| client.send(Kill { psid }));
 
-    for w in future::join_all(work).await {
-        w?;
-    }
+    // for w in future::join_all(work).await {
+    //     w?;
+    // }
 
-    client.shutdown().await
+    // client.shutdown().await
+
+    let client = Wrap::spawn()?;
+    client.full_cmd().await;
+
+    Ok(())
 }
 
 struct Client {
@@ -161,6 +169,10 @@ impl Client {
         }
     }
 
+    fn handle(&self) -> Handle {
+        Handle { tx_to_server: self.tx_to_server.clone() }
+    }
+
     async fn send(&self, cmd: impl Into<ServerMessage>) -> Result<()> {
         self.tx_to_server
             .send(cmd.into())
@@ -188,6 +200,126 @@ impl Client {
         tx_to_server_task.context(UnableToJoinTxToServerTaskSnafu)??;
 
         Ok(())
+    }
+}
+
+struct Handle { tx_to_server: mpsc::Sender<ServerMessage> }
+
+impl Handle {
+    async fn send(&self, cmd: impl Into<ServerMessage>) -> Result<()> {
+        self.tx_to_server
+            .send(cmd.into())
+            .await
+            .context(UnableToRelayMessageToServerSnafu)
+    }
+}
+
+#[derive(Debug)]
+struct Z { spawn: Spawn, doit: oneshot::Sender<(Vec<u8>, Vec<u8>)> }
+
+struct Wrap {
+    client: Client,
+    z_tx: mpsc::Sender<Z>,
+    z_task: task::JoinHandle<Result<()>>,
+}
+
+impl Wrap {
+    fn spawn() -> Result<Self> {
+//        let (tx, rx) = mpsc::channel(10);
+        let (client, mut client_rx) = Client::spawn()?;
+        let (mut z_tx, mut z_rx) = mpsc::channel(10);
+
+        struct State {
+            client: Handle,
+            listening: BTreeMap<ProcessSequenceId, (Vec<u8>, Vec<u8>, oneshot::Sender<(Vec<u8>, Vec<u8>)>)>,
+        }
+
+        impl State {
+
+            fn new(client: Handle) -> Self {
+                Self {
+                    client,
+                    listening: Default::default(),
+                }
+            }
+
+            async fn do_z_recv(&mut self, z: Z) {
+                trace!(z=?z, "do_z_recv");
+                let Z { spawn, doit } = z;
+                self.listening.insert(spawn.psid, (Default::default(), Default::default(), doit));
+                self.client.send(spawn).await.unwrap();
+            }
+
+            fn do_client_recv(&mut self, msg: ClientMessage) {
+                use ClientMessage as Msg;
+
+                trace!(msg=?msg, "do_client_recv");
+
+                match &msg {
+                    Msg::ChildStarted(..) => {},
+
+                    Msg::Output(Output { psid, stdout, stderr }) => {
+                        if let Some(v) = self.listening.get_mut(psid) {
+                            v.0.extend_from_slice(stdout);
+                            v.1.extend_from_slice(stderr);
+                        }
+                    }
+
+                    Msg::ChildStopped(ChildStopped { psid }) => {
+                        if let Some((stdout, stderr, doit)) = self.listening.remove(psid) {
+                            doit.send((stdout, stderr)).unwrap();
+                        }
+                    }
+                }
+
+                // tx.send(msg);
+
+            }
+        }
+
+        let z_task = tokio::spawn({
+            let client = client.handle();
+            async move {
+                let mut state = State::new(client);
+
+                loop {
+                    tokio::select! {
+                        z = z_rx.recv() => {
+                            match z {
+                                Some(z) => state.do_z_recv(z).await,
+                                None => break,
+                            }
+                        },
+                        msg = client_rx.recv() => {
+                            match msg {
+                                Some(msg) => state.do_client_recv(msg),
+                                None => break,
+                            }
+                        },
+                    }
+                }
+
+                Ok(())
+            }
+        });
+
+        let this = Wrap { client, z_tx, z_task };
+
+        Ok(this)
+    }
+
+    async fn full_cmd(&self) {
+        let psid = ProcessSequenceId::new(42);
+        let (tx, rx) = oneshot::channel();
+        let spawn = Spawn { psid, command: "uname".into() };
+        self.z_tx.send(Z { doit: tx, spawn }).await.unwrap();
+        let (stdout, stderr) = rx.await.unwrap();
+
+        let stdout = String::from_utf8_lossy(&stdout);
+        let stderr = String::from_utf8_lossy(&stderr);
+
+        eprintln!("{stdout}{stderr}");
+
     }
 }
 
